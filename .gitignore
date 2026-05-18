@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Mac
+.DS_Store
+
+# VSCode
+.vscode/
+
+# PyTorch
+*.pt
+*.pth
+
+# data
+data/
+
+# outputs
+outputs/
