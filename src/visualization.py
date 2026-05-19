@@ -4,6 +4,14 @@ import numpy as np
 from src.simulation import Detection
 
 
+def save_figure(fig, save_path=None, dpi=200):
+    """save_path が指定された場合だけ、図をファイルとして保存します。"""
+
+    if save_path is None:
+        return
+    fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+
+
 def draw_pose(ax, x, y, theta, label=None, marker="o"):
     """位置と向きを持つ点を描画します。
 
@@ -28,7 +36,7 @@ def draw_pose(ax, x, y, theta, label=None, marker="o"):
         ax.text(x + 0.6, y + 0.6, label, fontsize=9)
 
 
-def plot_true_scene(agents_gt, objects_gt):
+def plot_true_scene(agents_gt, objects_gt, save_path=None):
     """真のシーンを描画します。
 
     表示するもの:
@@ -52,10 +60,11 @@ def plot_true_scene(agents_gt, objects_gt):
     # x, y のスケールを揃え、距離感が歪まないようにします。
     ax.axis("equal")
     ax.grid(True)
+    save_figure(fig, save_path)
     plt.show()
 
 
-def plot_detected_scene(agents_gt, agent_pose_est, detections_by_agent):
+def plot_detected_scene(agents_gt, agent_pose_est, detections_by_agent, save_path=None):
     """各エージェントの検出結果を global 座標上に描画します。
 
     表示するもの:
@@ -95,6 +104,7 @@ def plot_detected_scene(agents_gt, agent_pose_est, detections_by_agent):
     ax.axis("equal")
     ax.grid(True)
     ax.legend()
+    save_figure(fig, save_path)
     plt.show()
 
 
@@ -106,6 +116,7 @@ def plot_pairwise_matching_result(
     agent_j: int,
     title: str = "Pairwise matching result",
     params: dict = None,
+    save_path=None,
 ):
     """2エージェント間のマッチング結果を可視化します。
 
@@ -264,4 +275,5 @@ def plot_pairwise_matching_result(
     ax.axis("equal")
     ax.grid(True)
     plt.subplots_adjust(right=0.75)
+    save_figure(fig, save_path)
     plt.show()
