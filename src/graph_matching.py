@@ -11,14 +11,14 @@ from src.simulation import Detection, wrap_angle
 
 
 ROCO_PARAMS = {
-    "tau2": 6.0,
+    "tau2": 4.0,
     "tau1": 0.3,
     "lambda_dist": 1.0,
     "neighbor_radius": 15.0,
 }
 
 RRWM_PARAMS = {
-    "candidate_radius": 6.0,
+    "candidate_radius": 4.0,
     "unary_weight": 2.0,
     "pairwise_weight": 1.0,
     "sigma_pos": 2.0,
@@ -1088,19 +1088,31 @@ def print_method_comparison_table(
 ) -> None:
     """RoCo-style、Pairwise RRWM、k-wise RRWM の性能比較表を表示します。"""
 
+    comparison_df = build_method_comparison_dataframe(
+        agent_pairs=agent_pairs,
+        roco_results=roco_results,
+        rrwm_results=rrwm_results,
+        kwise_matches=kwise_matches,
+        detections_by_agent=detections_by_agent,
+    )
+
     print("\n" + "=" * 110)
     print("Matching Performance Comparison")
     print("=" * 110)
-    print(
-        f"{'Method':<22}"
-        f"{'Pair':<12}"
-        f"{'TP':<8}"
-        f"{'FP':<8}"
-        f"{'FN':<8}"
-        f"{'Precision':<14}"
-        f"{'Recall':<14}"
-    )
-    print("-" * 110)
+    print(comparison_df.to_string(index=False))
+    print("=" * 110)
+
+
+def build_method_comparison_records(
+    agent_pairs: List[Tuple[int, int]],
+    roco_results: Dict[Tuple[int, int], Dict[str, object]],
+    rrwm_results: Dict[Tuple[int, int], Dict[str, object]],
+    kwise_matches: List[Tuple[int, int, int, float]],
+    detections_by_agent: Dict[int, List[Detection]],
+) -> List[Dict[str, object]]:
+    """3手法の比較結果を、表にしやすい record list として作ります。"""
+
+    records = []
 
     for method_name, results in [
         ("RoCo-style", roco_results),
@@ -1108,19 +1120,22 @@ def print_method_comparison_table(
     ]:
         for i, j in agent_pairs:
             eval_result = results[(i, j)]["evaluation"]
-            tp = eval_result["correct"]
-            fp = eval_result["predicted_matches"] - tp
-            fn = eval_result["gt_matches"] - tp
-            print(
-                f"{method_name:<22}"
-                f"{f'{i}-{j}':<12}"
-                f"{tp:<8}"
-                f"{fp:<8}"
-                f"{fn:<8}"
-                f"{eval_result['precision']:<14.4f}"
-                f"{eval_result['recall']:<14.4f}"
+            tp = int(eval_result["correct"])
+            predicted = int(eval_result["predicted_matches"])
+            gt = int(eval_result["gt_matches"])
+            records.append(
+                {
+                    "method": method_name,
+                    "pair": f"{i}-{j}",
+                    "tp": tp,
+                    "fp": predicted - tp,
+                    "fn": gt - tp,
+                    "gt_matches": gt,
+                    "predicted_matches": predicted,
+                    "precision": float(eval_result["precision"]),
+                    "recall": float(eval_result["recall"]),
+                }
             )
-        print()
 
     for i, j in agent_pairs:
         eval_result = evaluate_kwise_as_pairwise(
@@ -1129,17 +1144,53 @@ def print_method_comparison_table(
             kwise_matches,
             pair=(i, j),
         )
-        tp = eval_result["correct"]
-        fp = eval_result["predicted_matches"] - tp
-        fn = eval_result["gt_matches"] - tp
-        print(
-            f"{'k-wise MGM RRWM':<22}"
-            f"{f'{i}-{j}':<12}"
-            f"{tp:<8}"
-            f"{fp:<8}"
-            f"{fn:<8}"
-            f"{eval_result['precision']:<14.4f}"
-            f"{eval_result['recall']:<14.4f}"
+        tp = int(eval_result["correct"])
+        predicted = int(eval_result["predicted_matches"])
+        gt = int(eval_result["gt_matches"])
+        records.append(
+            {
+                "method": "k-wise MGM RRWM",
+                "pair": f"{i}-{j}",
+                "tp": tp,
+                "fp": predicted - tp,
+                "fn": gt - tp,
+                "gt_matches": gt,
+                "predicted_matches": predicted,
+                "precision": float(eval_result["precision"]),
+                "recall": float(eval_result["recall"]),
+            }
         )
 
-    print("=" * 110)
+    return records
+
+
+def build_method_comparison_dataframe(
+    agent_pairs: List[Tuple[int, int]],
+    roco_results: Dict[Tuple[int, int], Dict[str, object]],
+    rrwm_results: Dict[Tuple[int, int], Dict[str, object]],
+    kwise_matches: List[Tuple[int, int, int, float]],
+    detections_by_agent: Dict[int, List[Detection]],
+):
+    """3手法の比較結果を pandas.DataFrame として返します。"""
+
+    import pandas as pd
+
+    records = build_method_comparison_records(
+        agent_pairs=agent_pairs,
+        roco_results=roco_results,
+        rrwm_results=rrwm_results,
+        kwise_matches=kwise_matches,
+        detections_by_agent=detections_by_agent,
+    )
+    columns = [
+        "method",
+        "pair",
+        "tp",
+        "fp",
+        "fn",
+        "gt_matches",
+        "predicted_matches",
+        "precision",
+        "recall",
+    ]
+    return pd.DataFrame.from_records(records, columns=columns)

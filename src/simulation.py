@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -94,11 +94,14 @@ def generate_true_scene(
     num_objects: int = 12,
     area_size: Tuple[float, float] = (60.0, 40.0),
     seed: int = 7,
+    rng: Optional[np.random.Generator] = None,
 ) -> Tuple[List[AgentGT], List[ObjectGT]]:
     """真のエージェント配置と真の物体配置を生成します。"""
 
-    # seed を固定すると、同じ実験条件を再現できます。
-    rng = np.random.default_rng(seed)
+    # rng を渡すと、呼び出し元で乱数状態を共有できます。
+    # rng がない場合は seed から新しい乱数生成器を作ります。
+    if rng is None:
+        rng = np.random.default_rng(seed)
 
     # 3エージェントは手動配置します。
     # theta はエージェントの向きです。
@@ -142,6 +145,7 @@ def generate_detections(
     agent_yaw_noise_std_deg: float = 3.0,
     num_outliers_per_agent: int = 2,
     seed: int = 7,
+    rng: Optional[np.random.Generator] = None,
 ) -> Tuple[Dict[int, Tuple[float, float, float]], Dict[int, List[Detection]]]:
     """各エージェントのノイズ付き検出結果を生成します。
 
@@ -155,7 +159,10 @@ def generate_detections(
     7. outlier、つまり誤検出を追加する
     """
 
-    rng = np.random.default_rng(seed)
+    # generate_true_scene と同じ rng を渡すと、以前の notebook のように
+    # シーン生成後の乱数状態から検出生成を続けられます。
+    if rng is None:
+        rng = np.random.default_rng(seed)
     # 視野角を degree から radian に変換します。
     fov = np.deg2rad(fov_deg)
 
@@ -216,9 +223,9 @@ def generate_detections(
                     x_local=lx_n,
                     y_local=ly_n,
                     theta_local=ltheta_n,
-                    x_global_est=gx_est,
-                    y_global_est=gy_est,
-                    theta_global_est=gtheta_est,
+                    x_global_est=gx_est, # ノイズを含む
+                    y_global_est=gy_est, # ノイズを含む
+                    theta_global_est=gtheta_est, # ノイズを含む
                 )
             )
             det_id += 1
