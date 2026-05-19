@@ -1170,8 +1170,12 @@ def build_method_comparison_dataframe(
     rrwm_results: Dict[Tuple[int, int], Dict[str, object]],
     kwise_matches: List[Tuple[int, int, int, float]],
     detections_by_agent: Dict[int, List[Detection]],
+    sort_by_pair: bool = True,
 ):
-    """3手法の比較結果を pandas.DataFrame として返します。"""
+    """3手法の比較結果を pandas.DataFrame として返します。
+
+    sort_by_pair=True の場合は、各ペアごとに3手法を並べます。
+    """
 
     import pandas as pd
 
@@ -1193,4 +1197,21 @@ def build_method_comparison_dataframe(
         "precision",
         "recall",
     ]
-    return pd.DataFrame.from_records(records, columns=columns)
+    df = pd.DataFrame.from_records(records, columns=columns)
+
+    if sort_by_pair and not df.empty:
+        pair_order = {f"{i}-{j}": order for order, (i, j) in enumerate(agent_pairs)}
+        method_order = {
+            "RoCo-style": 0,
+            "Pairwise RRWM": 1,
+            "k-wise MGM RRWM": 2,
+        }
+        df["_pair_order"] = df["pair"].map(pair_order)
+        df["_method_order"] = df["method"].map(method_order)
+        df = (
+            df.sort_values(["_pair_order", "_method_order"])
+            .drop(columns=["_pair_order", "_method_order"])
+            .reset_index(drop=True)
+        )
+
+    return df
