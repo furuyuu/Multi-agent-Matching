@@ -1,5 +1,6 @@
 import matplotlib.pyplot as plt
 import numpy as np
+from pathlib import Path
 
 from src.simulation import Detection, ObjectGT
 
@@ -9,6 +10,8 @@ def save_figure(fig, save_path=None, dpi=200):
 
     if save_path is None:
         return
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
 
 
