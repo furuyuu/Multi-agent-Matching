@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 import numpy as np
 
-from src.simulation import Detection
+from src.simulation import Detection, ObjectGT
 
 
 def save_figure(fig, save_path=None, dpi=200):
@@ -116,6 +116,7 @@ def plot_pairwise_matching_result(
     agent_j: int,
     title: str = "Pairwise matching result",
     params: dict = None,
+    objects_gt: list[ObjectGT] = None,
     save_path=None,
 ):
     """2エージェント間のマッチング結果を可視化します。
@@ -159,6 +160,37 @@ def plot_pairwise_matching_result(
         s=80,
         label=f"Agent {agent_j}",
     )
+
+    # 必要に応じて真の物体位置を、検出点とは別の色・marker で重ねます。
+    if objects_gt is not None:
+        visible_true_obj_ids = {
+            d.true_obj_id
+            for d in [*dets_i, *dets_j]
+            if d.true_obj_id >= 0
+        }
+        visible_objects_gt = [
+            obj for obj in objects_gt if obj.obj_id in visible_true_obj_ids
+        ]
+        if visible_objects_gt:
+            ax.scatter(
+                [obj.x for obj in visible_objects_gt],
+                [obj.y for obj in visible_objects_gt],
+                marker="*",
+                s=180,
+                color="magenta",
+                edgecolors="black",
+                linewidths=0.8,
+                label="True object position",
+                zorder=5,
+            )
+            for obj in visible_objects_gt:
+                ax.text(
+                    obj.x + 0.3,
+                    obj.y - 0.7,
+                    f"GT-O{obj.obj_id}",
+                    fontsize=8,
+                    color="magenta",
+                )
 
     # 各検出点に det_id と true_obj_id を表示します。
     for d in dets_i:
