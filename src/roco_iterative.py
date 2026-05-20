@@ -451,6 +451,29 @@ def evaluate_iterative_roco_pose_errors(
     }
 
 
+def evaluate_iterative_roco_pose_error_history(
+    iterative_result: Dict[str, object],
+    agents_gt: List[AgentGT],
+    objects_gt: List[ObjectGT],
+) -> List[Dict[str, object]]:
+    """各 iteration の agent/object pose 推定を真値と比較します。"""
+
+    results = []
+    for state in iterative_result.get("history", []):
+        state_result = evaluate_iterative_roco_pose_errors(
+            state,
+            agents_gt,
+            objects_gt,
+        )
+        state_result["iteration"] = state["iteration"]
+        state_result["max_pose_delta"] = max(
+            state.get("pose_deltas", {}).values(),
+            default=0.0,
+        )
+        results.append(state_result)
+    return results
+
+
 def evaluate_agent_pose_errors(
     agent_poses: Dict[int, Pose2D],
     agents_gt: List[AgentGT],
@@ -509,12 +532,33 @@ def build_pose_error_summary_dataframe(pose_error_result: Dict[str, object]):
     return pd.DataFrame.from_records(records)
 
 
+def build_pose_error_history_dataframe(pose_error_history: List[Dict[str, object]]):
+    """iteration ごとの overall / agents / objects pose 誤差を pandas.DataFrame にします。"""
+
+    import pandas as pd
+
+    records = []
+    for state_result in pose_error_history:
+        iteration = state_result["iteration"]
+        max_pose_delta = state_result["max_pose_delta"]
+        for target, metrics in state_result["summary"].items():
+            records.append(
+                {
+                    "iteration": iteration,
+                    "target": target,
+                    "max_pose_delta": max_pose_delta,
+                    **metrics,
+                }
+            )
+    return pd.DataFrame.from_records(records)
+
+
 def build_agent_pose_error_dataframe(pose_error_result: Dict[str, object]):
     """agent ごとの pose 誤差を pandas.DataFrame にします。"""
 
     import pandas as pd
 
-    return pd.DataFrame.from_records(pose_error_result["agent_errors"].values())
+    return pd.DataFrame.from_records(list(pose_error_result["agent_errors"].values()))
 
 
 def build_object_pose_error_dataframe(pose_error_result: Dict[str, object]):
@@ -522,7 +566,7 @@ def build_object_pose_error_dataframe(pose_error_result: Dict[str, object]):
 
     import pandas as pd
 
-    return pd.DataFrame.from_records(pose_error_result["object_errors"].values())
+    return pd.DataFrame.from_records(list(pose_error_result["object_errors"].values()))
 
 
 def _rotmat(theta: float) -> np.ndarray:
