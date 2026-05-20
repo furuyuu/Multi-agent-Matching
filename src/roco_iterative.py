@@ -4,8 +4,14 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from src.graph_matching import (
+    KWISE_PARAMS,
     ROCO_PARAMS,
+    RRWM_PARAMS,
     evaluate_pairwise_matching,
+    evaluate_kwise_matching_3agents,
+    kwise_rrwm_matching_3agents,
+    kwise_to_pairwise_matches,
+    pairwise_rrwm_matching,
     roco_pairwise_matching,
 )
 from src.simulation import AgentGT, Detection, ObjectGT, local_to_global, wrap_angle
@@ -155,6 +161,64 @@ def run_roco_matching_all_pairs(
     }
 
 
+def run_pairwise_rrwm_matching_all_pairs(
+    detections_by_agent: Dict[int, List[Detection]],
+    agent_pairs: List[Tuple[int, int]],
+    rrwm_params: Dict[str, float] = None,
+) -> PairwiseMatches:
+    """指定された全 agent pair で pairwise RRWM matching を実行します。"""
+
+    if rrwm_params is None:
+        rrwm_params = RRWM_PARAMS
+
+    pairwise_matches = {}
+    for i, j in agent_pairs:
+        matches, _, _, _ = pairwise_rrwm_matching(
+            detections_by_agent[i],
+            detections_by_agent[j],
+            **rrwm_params,
+        )
+        pairwise_matches[(i, j)] = matches
+    return pairwise_matches
+
+
+def run_kwise_rrwm_matching_as_pairwise(
+    detections_by_agent: Dict[int, List[Detection]],
+    agent_pairs: List[Tuple[int, int]],
+    kwise_params: Dict[str, float] = None,
+    agent_ids: Tuple[int, int, int] = (0, 1, 2),
+) -> Tuple[PairwiseMatches, Dict[str, object]]:
+    """3-wise RRWM matching を実行し、pose 更新用に pairwise matches へ変換します。"""
+
+    if kwise_params is None:
+        kwise_params = KWISE_PARAMS
+
+    agent_0, agent_1, agent_2 = agent_ids
+    kwise_matches, soft_score, affinity_matrix, candidates = kwise_rrwm_matching_3agents(
+        detections_by_agent[agent_0],
+        detections_by_agent[agent_1],
+        detections_by_agent[agent_2],
+        **kwise_params,
+    )
+    pairwise_matches = {
+        pair: kwise_to_pairwise_matches(kwise_matches, pair=pair)
+        for pair in agent_pairs
+    }
+    kwise_evaluation = evaluate_kwise_matching_3agents(
+        detections_by_agent[agent_0],
+        detections_by_agent[agent_1],
+        detections_by_agent[agent_2],
+        kwise_matches,
+    )
+    return pairwise_matches, {
+        "kwise_matches": kwise_matches,
+        "kwise_evaluation": kwise_evaluation,
+        "kwise_soft_score": soft_score,
+        "kwise_affinity_matrix": affinity_matrix,
+        "kwise_candidates": candidates,
+    }
+
+
 def estimate_object_positions_from_anchor_matches(
     detections_by_agent: Dict[int, List[Detection]],
     pairwise_matches: PairwiseMatches,
@@ -236,26 +300,18 @@ def estimate_object_poses_from_anchor_matches(
     return tracks, track_true_object_ids
 
 
-def run_iterative_roco_pose_adjustment(
+def _run_iterative_pose_adjustment(
     detections_by_agent: Dict[int, List[Detection]],
     agent_pose_est: Dict[int, Pose2D],
     agent_pairs: List[Tuple[int, int]],
-    roco_params: Dict[str, float] = None,
+    matching_method: str,
+    match_pairwise_fn,
     anchor_agent_id: int = 0,
     max_iter: int = 10,
     damping: float = 0.8,
     pose_tol: float = 1e-3,
     min_matches_for_pose: int = 2,
 ) -> Dict[str, object]:
-    """RoCo matching と pose adjustment を交互に実行します。
-
-    現在は anchor_agent_id を固定し、anchor との対応から他エージェントの
-    pose を更新する最小実装です。既存の matching-only 比較とは独立に使えます。
-    """
-
-    if roco_params is None:
-        roco_params = ROCO_PARAMS
-
     current_poses = {
         agent_id: tuple(pose) for agent_id, pose in agent_pose_est.items()
     }
@@ -266,11 +322,7 @@ def run_iterative_roco_pose_adjustment(
             detections_by_agent,
             current_poses,
         )
-        pairwise_matches = run_roco_matching_all_pairs(
-            adjusted_detections,
-            agent_pairs,
-            roco_params=roco_params,
-        )
+        pairwise_matches, match_extras = match_pairwise_fn(adjusted_detections)
 
         next_poses = dict(current_poses)
         pose_deltas = {}
@@ -320,11 +372,7 @@ def run_iterative_roco_pose_adjustment(
             detections_by_agent,
             current_poses,
         )
-        pairwise_matches = run_roco_matching_all_pairs(
-            adjusted_detections,
-            agent_pairs,
-            roco_params=roco_params,
-        )
+        pairwise_matches, match_extras = match_pairwise_fn(adjusted_detections)
         pairwise_evaluations = {
             pair: evaluate_pairwise_matching(
                 adjusted_detections[pair[0]],
@@ -343,49 +391,175 @@ def run_iterative_roco_pose_adjustment(
             for track_id, pose in object_poses.items()
         }
 
-        history.append(
-            {
-                "iteration": iteration + 1,
-                "agent_poses": dict(current_poses),
-                "pose_deltas": dict(pose_deltas),
-                "pairwise_matches": pairwise_matches,
-                "pairwise_evaluations": pairwise_evaluations,
-                "object_poses": object_poses,
-                "object_positions": object_positions,
-                "track_true_object_ids": track_true_object_ids,
-            }
-        )
+        history_state = {
+            "iteration": iteration + 1,
+            "matching_method": matching_method,
+            "agent_poses": dict(current_poses),
+            "pose_deltas": dict(pose_deltas),
+            "pairwise_matches": pairwise_matches,
+            "pairwise_evaluations": pairwise_evaluations,
+            "object_poses": object_poses,
+            "object_positions": object_positions,
+            "track_true_object_ids": track_true_object_ids,
+        }
+        history_state.update(match_extras)
+        history.append(history_state)
 
         if max(pose_deltas.values(), default=0.0) < pose_tol:
             break
 
-    return {
+    final_state = history[-1] if history else {}
+    result = {
+        "matching_method": matching_method,
         "agent_poses": current_poses,
         "detections_by_agent": transform_detections_with_poses(
             detections_by_agent,
             current_poses,
         ),
-        "pairwise_matches": history[-1]["pairwise_matches"] if history else {},
-        "pairwise_evaluations": history[-1]["pairwise_evaluations"] if history else {},
-        "object_poses": history[-1]["object_poses"] if history else {},
-        "object_positions": history[-1]["object_positions"] if history else {},
-        "track_true_object_ids": history[-1]["track_true_object_ids"] if history else {},
+        "pairwise_matches": final_state.get("pairwise_matches", {}),
+        "pairwise_evaluations": final_state.get("pairwise_evaluations", {}),
+        "object_poses": final_state.get("object_poses", {}),
+        "object_positions": final_state.get("object_positions", {}),
+        "track_true_object_ids": final_state.get("track_true_object_ids", {}),
         "history": history,
     }
+    for key, value in final_state.items():
+        if key.startswith("kwise_"):
+            result[key] = value
+    return result
 
 
-def build_roco_iteration_dataframe(iterative_result: Dict[str, object]):
+def run_iterative_roco_pose_adjustment(
+    detections_by_agent: Dict[int, List[Detection]],
+    agent_pose_est: Dict[int, Pose2D],
+    agent_pairs: List[Tuple[int, int]],
+    roco_params: Dict[str, float] = None,
+    anchor_agent_id: int = 0,
+    max_iter: int = 10,
+    damping: float = 0.8,
+    pose_tol: float = 1e-3,
+    min_matches_for_pose: int = 2,
+) -> Dict[str, object]:
+    """RoCo matching と pose adjustment を交互に実行します。
+
+    現在は anchor_agent_id を固定し、anchor との対応から他エージェントの
+    pose を更新する最小実装です。既存の matching-only 比較とは独立に使えます。
+    """
+
+    if roco_params is None:
+        roco_params = ROCO_PARAMS
+
+    return _run_iterative_pose_adjustment(
+        detections_by_agent=detections_by_agent,
+        agent_pose_est=agent_pose_est,
+        agent_pairs=agent_pairs,
+        matching_method="roco",
+        match_pairwise_fn=lambda adjusted_detections: (
+            run_roco_matching_all_pairs(
+                adjusted_detections,
+                agent_pairs,
+                roco_params=roco_params,
+            ),
+            {},
+        ),
+        anchor_agent_id=anchor_agent_id,
+        max_iter=max_iter,
+        damping=damping,
+        pose_tol=pose_tol,
+        min_matches_for_pose=min_matches_for_pose,
+    )
+
+
+def run_iterative_pairwise_rrwm_pose_adjustment(
+    detections_by_agent: Dict[int, List[Detection]],
+    agent_pose_est: Dict[int, Pose2D],
+    agent_pairs: List[Tuple[int, int]],
+    rrwm_params: Dict[str, float] = None,
+    anchor_agent_id: int = 0,
+    max_iter: int = 10,
+    damping: float = 0.8,
+    pose_tol: float = 1e-3,
+    min_matches_for_pose: int = 2,
+) -> Dict[str, object]:
+    """Pairwise RRWM matching と pose adjustment を交互に実行します。"""
+
+    if rrwm_params is None:
+        rrwm_params = RRWM_PARAMS
+
+    return _run_iterative_pose_adjustment(
+        detections_by_agent=detections_by_agent,
+        agent_pose_est=agent_pose_est,
+        agent_pairs=agent_pairs,
+        matching_method="pairwise_rrwm",
+        match_pairwise_fn=lambda adjusted_detections: (
+            run_pairwise_rrwm_matching_all_pairs(
+                adjusted_detections,
+                agent_pairs,
+                rrwm_params=rrwm_params,
+            ),
+            {},
+        ),
+        anchor_agent_id=anchor_agent_id,
+        max_iter=max_iter,
+        damping=damping,
+        pose_tol=pose_tol,
+        min_matches_for_pose=min_matches_for_pose,
+    )
+
+
+def run_iterative_kwise_rrwm_pose_adjustment(
+    detections_by_agent: Dict[int, List[Detection]],
+    agent_pose_est: Dict[int, Pose2D],
+    agent_pairs: List[Tuple[int, int]],
+    kwise_params: Dict[str, float] = None,
+    anchor_agent_id: int = 0,
+    max_iter: int = 10,
+    damping: float = 0.8,
+    pose_tol: float = 1e-3,
+    min_matches_for_pose: int = 2,
+    agent_ids: Tuple[int, int, int] = (0, 1, 2),
+) -> Dict[str, object]:
+    """3-wise RRWM matching と pose adjustment を交互に実行します。"""
+
+    if kwise_params is None:
+        kwise_params = KWISE_PARAMS
+
+    if tuple(agent_ids) != (0, 1, 2):
+        raise ValueError("k-wise iterative adjustment currently expects agent_ids=(0, 1, 2)")
+
+    return _run_iterative_pose_adjustment(
+        detections_by_agent=detections_by_agent,
+        agent_pose_est=agent_pose_est,
+        agent_pairs=agent_pairs,
+        matching_method="kwise_rrwm",
+        match_pairwise_fn=lambda adjusted_detections: run_kwise_rrwm_matching_as_pairwise(
+            adjusted_detections,
+            agent_pairs,
+            kwise_params=kwise_params,
+            agent_ids=agent_ids,
+        ),
+        anchor_agent_id=anchor_agent_id,
+        max_iter=max_iter,
+        damping=damping,
+        pose_tol=pose_tol,
+        min_matches_for_pose=min_matches_for_pose,
+    )
+
+
+def build_iterative_matching_dataframe(iterative_result: Dict[str, object]):
     """反復ごとの pose 変化量と matching 精度を pandas.DataFrame にします。"""
 
     import pandas as pd
 
     records = []
+    matching_method = iterative_result.get("matching_method", "unknown")
     for state in iterative_result["history"]:
         iteration = state["iteration"]
         max_pose_delta = max(state["pose_deltas"].values(), default=0.0)
         for pair, evaluation in state["pairwise_evaluations"].items():
             records.append(
                 {
+                    "method": matching_method,
                     "iteration": iteration,
                     "pair": f"{pair[0]}-{pair[1]}",
                     "max_pose_delta": max_pose_delta,
@@ -398,6 +572,12 @@ def build_roco_iteration_dataframe(iterative_result: Dict[str, object]):
             )
 
     return pd.DataFrame.from_records(records)
+
+
+def build_roco_iteration_dataframe(iterative_result: Dict[str, object]):
+    """反復ごとの pose 変化量と matching 精度を pandas.DataFrame にします。"""
+
+    return build_iterative_matching_dataframe(iterative_result)
 
 
 def build_estimated_object_position_dataframe(iterative_result: Dict[str, object]):
@@ -466,6 +646,7 @@ def evaluate_iterative_roco_pose_error_history(
             objects_gt,
         )
         state_result["iteration"] = state["iteration"]
+        state_result["matching_method"] = state.get("matching_method", "unknown")
         state_result["max_pose_delta"] = max(
             state.get("pose_deltas", {}).values(),
             default=0.0,
@@ -541,9 +722,11 @@ def build_pose_error_history_dataframe(pose_error_history: List[Dict[str, object
     for state_result in pose_error_history:
         iteration = state_result["iteration"]
         max_pose_delta = state_result["max_pose_delta"]
+        matching_method = state_result.get("matching_method", "unknown")
         for target, metrics in state_result["summary"].items():
             records.append(
                 {
+                    "method": matching_method,
                     "iteration": iteration,
                     "target": target,
                     "max_pose_delta": max_pose_delta,
