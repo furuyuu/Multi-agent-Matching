@@ -7,7 +7,7 @@
 - Pairwise graph matching with RRWM
 - 3-wise / k-wise MGM style RRWM
 
-実験は [notebooks/experiment.ipynb](notebooks/experiment.ipynb) から実行します。結果は `results/YYYYMMDD_HHMMSS_JST_seed_X/` に保存されます。CSV は解析用に保存し、同時に `summary.html` も生成して、画像と表をブラウザで確認できるようにしています。
+実験は [notebooks/experiment.ipynb](notebooks/experiment.ipynb) から実行します。結果は repository root、つまりこの `research` フォルダ内の `results/YYYYMMDD_HHMMSS_JST_seed_X/` に保存されます。CSV は解析用に保存し、同時に `summary.html` も生成して、画像と表をブラウザで確認できるようにしています。
 
 ## 問題設定
 
