@@ -5,12 +5,15 @@ import numpy as np
 
 from src.graph_matching import (
     KWISE_PARAMS,
+    PARTIAL_OT_PARAMS,
     ROCO_PARAMS,
     RRWM_PARAMS,
     evaluate_pairwise_matching,
     evaluate_kwise_matching_3agents,
     kwise_rrwm_matching_3agents,
     kwise_to_pairwise_matches,
+    partial_ot_anchor_pose_registration,
+    partial_ot_pairwise_matching,
     pairwise_rrwm_matching,
     roco_pairwise_matching,
 )
@@ -216,6 +219,35 @@ def run_kwise_rrwm_matching_as_pairwise(
         "kwise_soft_score": soft_score,
         "kwise_affinity_matrix": affinity_matrix,
         "kwise_candidates": candidates,
+    }
+
+
+def run_partial_ot_matching_all_pairs(
+    detections_by_agent: Dict[int, List[Detection]],
+    agent_pairs: List[Tuple[int, int]],
+    partial_ot_params: Dict[str, float] = None,
+) -> Tuple[PairwiseMatches, Dict[str, object]]:
+    """指定された全 agent pair で partial OT registration matching を実行します。"""
+
+    if partial_ot_params is None:
+        partial_ot_params = PARTIAL_OT_PARAMS
+
+    pairwise_matches = {}
+    registration_poses = {}
+    transport_plans = {}
+    for i, j in agent_pairs:
+        matches, pose, transport_plan = partial_ot_pairwise_matching(
+            detections_by_agent[i],
+            detections_by_agent[j],
+            **partial_ot_params,
+        )
+        pairwise_matches[(i, j)] = matches
+        registration_poses[(i, j)] = pose
+        transport_plans[(i, j)] = transport_plan
+
+    return pairwise_matches, {
+        "partial_ot_registration_poses": registration_poses,
+        "partial_ot_transport_plans": transport_plans,
     }
 
 
@@ -544,6 +576,144 @@ def run_iterative_kwise_rrwm_pose_adjustment(
         pose_tol=pose_tol,
         min_matches_for_pose=min_matches_for_pose,
     )
+
+
+def run_iterative_partial_ot_pose_adjustment(
+    detections_by_agent: Dict[int, List[Detection]],
+    agent_pose_est: Dict[int, Pose2D],
+    agent_pairs: List[Tuple[int, int]],
+    partial_ot_params: Dict[str, float] = None,
+    anchor_agent_id: int = 0,
+    max_iter: int = 10,
+    damping: float = 0.8,
+    pose_tol: float = 1e-3,
+    min_matches_for_pose: int = 2,
+) -> Dict[str, object]:
+    """Partial OT rigid registration により pose adjustment を反復実行します。
+
+    論文手法に合わせ、anchor の global 検出点群と target の local 検出点群を
+    直接 rigid registration して target agent pose を推定します。得られた
+    transport plan は、評価・可視化用の pairwise matches に離散化します。
+    """
+
+    if partial_ot_params is None:
+        partial_ot_params = PARTIAL_OT_PARAMS
+
+    current_poses = {
+        agent_id: tuple(pose) for agent_id, pose in agent_pose_est.items()
+    }
+    history = []
+
+    for iteration in range(max_iter):
+        adjusted_detections = transform_detections_with_poses(
+            detections_by_agent,
+            current_poses,
+        )
+        next_poses = dict(current_poses)
+        pose_deltas = {}
+        pairwise_matches = {}
+        transport_plans = {}
+
+        for agent_id in sorted(current_poses):
+            if agent_id == anchor_agent_id:
+                pose_deltas[agent_id] = 0.0
+                continue
+
+            estimated_pose, matches, transport_plan = partial_ot_anchor_pose_registration(
+                adjusted_detections[anchor_agent_id],
+                detections_by_agent[agent_id],
+                current_pose=current_poses[agent_id],
+                **partial_ot_params,
+            )
+            if len(matches) >= min_matches_for_pose:
+                damping_clipped = float(np.clip(damping, 0.0, 1.0))
+                current_xy = np.array(current_poses[agent_id][:2], dtype=float)
+                estimated_xy = np.array(estimated_pose[:2], dtype=float)
+                updated_xy = current_xy + damping_clipped * (estimated_xy - current_xy)
+                updated_theta = wrap_angle(
+                    current_poses[agent_id][2]
+                    + damping_clipped
+                    * wrap_angle(estimated_pose[2] - current_poses[agent_id][2])
+                )
+                next_poses[agent_id] = (
+                    float(updated_xy[0]),
+                    float(updated_xy[1]),
+                    float(updated_theta),
+                )
+
+            pair = (anchor_agent_id, agent_id)
+            pairwise_matches[pair] = matches
+            transport_plans[pair] = transport_plan
+            pose_deltas[agent_id] = pose_update_norm(
+                current_poses[agent_id],
+                next_poses[agent_id],
+            )
+
+        current_poses = next_poses
+        adjusted_detections = transform_detections_with_poses(
+            detections_by_agent,
+            current_poses,
+        )
+        pairwise_matches, match_extras = run_partial_ot_matching_all_pairs(
+            adjusted_detections,
+            agent_pairs,
+            partial_ot_params=partial_ot_params,
+        )
+        pairwise_evaluations = {
+            pair: evaluate_pairwise_matching(
+                adjusted_detections[pair[0]],
+                adjusted_detections[pair[1]],
+                matches,
+            )
+            for pair, matches in pairwise_matches.items()
+        }
+        object_poses, track_true_object_ids = estimate_object_poses_from_anchor_matches(
+            adjusted_detections,
+            pairwise_matches,
+            anchor_agent_id=anchor_agent_id,
+        )
+        object_positions = {
+            track_id: np.array([pose[0], pose[1]], dtype=float)
+            for track_id, pose in object_poses.items()
+        }
+
+        history_state = {
+            "iteration": iteration + 1,
+            "matching_method": "partial_ot",
+            "agent_poses": dict(current_poses),
+            "pose_deltas": dict(pose_deltas),
+            "pairwise_matches": pairwise_matches,
+            "pairwise_evaluations": pairwise_evaluations,
+            "object_poses": object_poses,
+            "object_positions": object_positions,
+            "track_true_object_ids": track_true_object_ids,
+        }
+        history_state.update(match_extras)
+        history.append(history_state)
+
+        if max(pose_deltas.values(), default=0.0) < pose_tol:
+            break
+
+    final_state = history[-1] if history else {}
+    return {
+        "matching_method": "partial_ot",
+        "agent_poses": current_poses,
+        "detections_by_agent": transform_detections_with_poses(
+            detections_by_agent,
+            current_poses,
+        ),
+        "pairwise_matches": final_state.get("pairwise_matches", {}),
+        "pairwise_evaluations": final_state.get("pairwise_evaluations", {}),
+        "object_poses": final_state.get("object_poses", {}),
+        "object_positions": final_state.get("object_positions", {}),
+        "track_true_object_ids": final_state.get("track_true_object_ids", {}),
+        "partial_ot_registration_poses": final_state.get(
+            "partial_ot_registration_poses",
+            {},
+        ),
+        "partial_ot_transport_plans": final_state.get("partial_ot_transport_plans", {}),
+        "history": history,
+    }
 
 
 def build_iterative_matching_dataframe(iterative_result: Dict[str, object]):

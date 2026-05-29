@@ -32,6 +32,16 @@ RRWM_PARAMS = {
 
 KWISE_PARAMS = RRWM_PARAMS.copy()
 
+PARTIAL_OT_PARAMS = {
+    "epsilon": 8.0,
+    "epsilon_decay": 0.93,
+    "beta2": 0.8,
+    "outer_iter": 30,
+    "inner_iter": 100,
+    "tol": 1e-5,
+    "match_score_threshold": 1e-4,
+}
+
 
 # ============================================================
 # Shared utilities
@@ -130,6 +140,177 @@ def stable_softmax_like(x: np.ndarray, beta: float) -> np.ndarray:
     z = z - np.max(z)
     y = np.exp(z)
     return y / np.maximum(np.sum(y), 1e-12)
+
+
+def points_from_detections(
+    detections: List[Detection],
+    coordinate: str = "global",
+) -> np.ndarray:
+    """Detection 群を 2D 点群に変換します。"""
+
+    if coordinate == "global":
+        return np.asarray([detection_position(det) for det in detections], dtype=float)
+    if coordinate == "local":
+        return np.asarray([[det.x_local, det.y_local] for det in detections], dtype=float)
+    raise ValueError("coordinate must be 'global' or 'local'")
+
+
+def pose_from_rotation_translation(
+    rotation: np.ndarray,
+    translation: np.ndarray,
+) -> Tuple[float, float, float]:
+    """2D 回転行列・並進ベクトルを Pose2D 相当の tuple にします。"""
+
+    theta = np.arctan2(rotation[1, 0], rotation[0, 0])
+    return (float(translation[0]), float(translation[1]), float(theta))
+
+
+def transform_points(points: np.ndarray, rotation: np.ndarray, translation: np.ndarray) -> np.ndarray:
+    """点群に 2D rigid transform を適用します。"""
+
+    return points @ rotation.T + translation
+
+
+def estimate_weighted_rigid_transform_2d(
+    source_points: np.ndarray,
+    target_points: np.ndarray,
+    transport_plan: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, bool]:
+    """transport plan で重み付けして target -> source の剛体変換を推定します。"""
+
+    total_mass = float(np.sum(transport_plan))
+    if total_mass <= 1e-12:
+        return np.eye(2), np.zeros(2), False
+
+    row_mass = np.sum(transport_plan, axis=1)
+    col_mass = np.sum(transport_plan, axis=0)
+    source_centroid = (source_points.T @ row_mass) / total_mass
+    target_centroid = (target_points.T @ col_mass) / total_mass
+
+    source_centered = source_points - source_centroid
+    target_centered = target_points - target_centroid
+    cross_cov = target_centered.T @ transport_plan.T @ source_centered
+
+    u_mat, _, vt_mat = np.linalg.svd(cross_cov)
+    correction = np.eye(2)
+    correction[-1, -1] = np.linalg.det(vt_mat.T @ u_mat.T)
+    rotation = vt_mat.T @ correction @ u_mat.T
+    translation = source_centroid - rotation @ target_centroid
+    return rotation, translation, True
+
+
+def partial_ot_transport_plan(
+    source_points: np.ndarray,
+    target_points: np.ndarray,
+    rotation: np.ndarray,
+    translation: np.ndarray,
+    epsilon: float = 1.0,
+    beta2: float = 1.0,
+    inner_iter: int = 100,
+    tol: float = 1e-8,
+) -> np.ndarray:
+    """range constraint 付き partial optimal transport plan を計算します。
+
+    論文の RG 制約に合わせ、各点の marginal は [0, uniform mass]、
+    total mass は [0, beta2] に収めます。
+    """
+
+    num_source = len(source_points)
+    num_target = len(target_points)
+    if num_source == 0 or num_target == 0:
+        return np.zeros((num_source, num_target))
+
+    beta2 = float(np.clip(beta2, 0.0, 1.0))
+    epsilon = max(float(epsilon), 1e-12)
+    transformed_target = transform_points(target_points, rotation, translation)
+    diff = source_points[:, None, :] - transformed_target[None, :, :]
+    cost = np.sum(diff * diff, axis=2)
+    kernel = np.exp(-cost / epsilon)
+
+    source_mass = np.full(num_source, 1.0 / num_source)
+    target_mass = np.full(num_target, 1.0 / num_target)
+    a = np.ones(num_source)
+    b = np.ones(num_target)
+    g = 1.0
+    eps = 1e-12
+
+    for _ in range(inner_iter):
+        old_a = a.copy()
+        old_b = b.copy()
+        old_g = g
+
+        row_proposal = g * (kernel @ b)
+        a = np.minimum(row_proposal, source_mass) / np.maximum(row_proposal, eps)
+
+        col_proposal = g * (kernel.T @ a)
+        b = np.minimum(col_proposal, target_mass) / np.maximum(col_proposal, eps)
+
+        unscaled_total = float(a @ kernel @ b)
+        total_proposal = g * unscaled_total
+        clipped_total = min(total_proposal, beta2)
+        g = clipped_total / max(unscaled_total, eps)
+
+        delta = (
+            np.linalg.norm(a - old_a)
+            + np.linalg.norm(b - old_b)
+            + abs(g - old_g)
+        )
+        if delta < tol:
+            break
+
+    return g * (a[:, None] * kernel * b[None, :])
+
+
+def partial_ot_rigid_registration_2d(
+    source_points: np.ndarray,
+    target_points: np.ndarray,
+    initial_pose: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+    epsilon: float = 8.0,
+    epsilon_decay: float = 0.93,
+    beta2: float = 0.8,
+    outer_iter: int = 30,
+    inner_iter: int = 100,
+    tol: float = 1e-5,
+) -> Tuple[Tuple[float, float, float], np.ndarray]:
+    """partial OT と weighted Procrustes を交互に解く 2D rigid registration。"""
+
+    theta = initial_pose[2]
+    rotation = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+    translation = np.array(initial_pose[:2], dtype=float)
+    transport_plan = np.zeros((len(source_points), len(target_points)))
+    current_epsilon = float(epsilon)
+
+    for _ in range(outer_iter):
+        old_rotation = rotation.copy()
+        old_translation = translation.copy()
+
+        transport_plan = partial_ot_transport_plan(
+            source_points,
+            target_points,
+            rotation,
+            translation,
+            epsilon=current_epsilon,
+            beta2=beta2,
+            inner_iter=inner_iter,
+        )
+        estimated_rotation, estimated_translation, did_update = estimate_weighted_rigid_transform_2d(
+            source_points,
+            target_points,
+            transport_plan,
+        )
+        if not did_update:
+            break
+
+        rotation = estimated_rotation
+        translation = estimated_translation
+        current_epsilon *= float(epsilon_decay)
+
+        delta_translation = np.linalg.norm(translation - old_translation)
+        delta_rotation = np.linalg.norm(rotation - old_rotation, ord="fro")
+        if delta_translation + delta_rotation < tol:
+            break
+
+    return pose_from_rotation_translation(rotation, translation), transport_plan
 
 
 # ============================================================
@@ -522,7 +703,102 @@ def pairwise_rrwm_matching(
 
 
 # ============================================================
-# 3. 3-wise matching with RRWM
+# 3. Partial optimal transport rigid registration
+# ============================================================
+
+
+def discretize_transport_plan(
+    transport_plan: np.ndarray,
+    dets_i: List[Detection],
+    dets_j: List[Detection],
+    score_threshold: float = 1e-4,
+) -> List[Tuple[int, int, float]]:
+    """transport plan を Hungarian algorithm で1対1対応に変換します。"""
+
+    if transport_plan.size == 0 or np.all(transport_plan <= 0):
+        return []
+
+    row_ind, col_ind = linear_sum_assignment(-transport_plan)
+    matches = []
+    for r, c in zip(row_ind, col_ind):
+        score = transport_plan[r, c]
+        if score > score_threshold:
+            matches.append((dets_i[r].det_id, dets_j[c].det_id, float(score)))
+    return matches
+
+
+def partial_ot_pairwise_matching(
+    dets_i: List[Detection],
+    dets_j: List[Detection],
+    epsilon: float = 8.0,
+    epsilon_decay: float = 0.93,
+    beta2: float = 0.8,
+    outer_iter: int = 30,
+    inner_iter: int = 100,
+    tol: float = 1e-5,
+    match_score_threshold: float = 1e-4,
+) -> Tuple[List[Tuple[int, int, float]], Tuple[float, float, float], np.ndarray]:
+    """global 推定点群同士を partial OT registration し、対応を返します。"""
+
+    source_points = points_from_detections(dets_i, coordinate="global")
+    target_points = points_from_detections(dets_j, coordinate="global")
+    pose, transport_plan = partial_ot_rigid_registration_2d(
+        source_points,
+        target_points,
+        epsilon=epsilon,
+        epsilon_decay=epsilon_decay,
+        beta2=beta2,
+        outer_iter=outer_iter,
+        inner_iter=inner_iter,
+        tol=tol,
+    )
+    matches = discretize_transport_plan(
+        transport_plan,
+        dets_i,
+        dets_j,
+        score_threshold=match_score_threshold,
+    )
+    return matches, pose, transport_plan
+
+
+def partial_ot_anchor_pose_registration(
+    anchor_detections: List[Detection],
+    target_detections: List[Detection],
+    current_pose: Tuple[float, float, float],
+    epsilon: float = 8.0,
+    epsilon_decay: float = 0.93,
+    beta2: float = 0.8,
+    outer_iter: int = 30,
+    inner_iter: int = 100,
+    tol: float = 1e-5,
+    match_score_threshold: float = 1e-4,
+) -> Tuple[Tuple[float, float, float], List[Tuple[int, int, float]], np.ndarray]:
+    """anchor global 点群へ target local 点群を partial OT で登録します。"""
+
+    source_points = points_from_detections(anchor_detections, coordinate="global")
+    target_points = points_from_detections(target_detections, coordinate="local")
+    estimated_pose, transport_plan = partial_ot_rigid_registration_2d(
+        source_points,
+        target_points,
+        initial_pose=current_pose,
+        epsilon=epsilon,
+        epsilon_decay=epsilon_decay,
+        beta2=beta2,
+        outer_iter=outer_iter,
+        inner_iter=inner_iter,
+        tol=tol,
+    )
+    matches = discretize_transport_plan(
+        transport_plan,
+        anchor_detections,
+        target_detections,
+        score_threshold=match_score_threshold,
+    )
+    return estimated_pose, matches, transport_plan
+
+
+# ============================================================
+# 4. 3-wise matching with RRWM
 # ============================================================
 
 

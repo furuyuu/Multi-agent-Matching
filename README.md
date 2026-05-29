@@ -6,6 +6,7 @@
 - RoCo-style pairwise matching
 - Pairwise graph matching with RRWM
 - 3-wise / k-wise MGM style RRWM
+- Partial optimal transport rigid registration
 
 実験は [notebooks/experiment.ipynb](notebooks/experiment.ipynb) から実行します。結果は repository root、つまりこの `research` フォルダ内の `results/YYYYMMDD_HHMMSS_JST_seed_X/` に保存されます。CSV は解析用に保存し、同時に `summary.html` も生成して、画像と表をブラウザで確認できるようにしています。
 
@@ -107,9 +108,27 @@ RRWM で三つ組候補の soft score を最適化した後、同じ検出が複
 - pairwise 手法では曖昧な対応を、多者制約で抑えられる可能性がある。
 - 候補数が増えやすく、計算量は pairwise より重くなりやすい。
 
+### Partial optimal transport rigid registration
+
+Partial OT は、Qin et al. の "Rigid Registration of Point Clouds Based on Partial Optimal Transport" をこの問題設定向けに 2D 化した手法です。
+
+anchor agent の global 検出点群と target agent の local 検出点群を点群登録問題として扱い、range constraint 付き transport plan と weighted Procrustes による剛体変換推定を交互に解きます。transport plan の total mass 上限 `beta2` によって、外れ値や片方にしか見えていない検出を無理に対応させないようにします。
+
+実装の入口:
+
+- [src/graph_matching.py](/Users/yusei/Documents/research/src/graph_matching.py): `partial_ot_rigid_registration_2d`, `partial_ot_pairwise_matching`, `partial_ot_anchor_pose_registration`
+- [src/roco_iterative.py](/Users/yusei/Documents/research/src/roco_iterative.py): `run_iterative_partial_ot_pose_adjustment`
+
+主要パラメータ:
+
+- `epsilon`: transport kernel の広がり。大きいほど大域的、小さいほど局所的な対応になる。
+- `epsilon_decay`: outer iteration ごとの `epsilon` 減衰率。
+- `beta2`: total transported mass の上限。重なり率や外れ値率に合わせて調整する。
+- `outer_iter`, `inner_iter`: 剛体変換更新と transport plan 更新の反復回数。
+
 ## Iterative pose adjustment
 
-対応付けだけでなく、対応結果を使った pose adjustment も実装しています。対象は RoCo-style、Pairwise RRWM、k-wise RRWM の3手法です。
+対応付けだけでなく、対応結果を使った pose adjustment も実装しています。対象は RoCo-style、Pairwise RRWM、k-wise RRWM、Partial OT の4手法です。
 
 反復処理の流れは次の通りです。
 
