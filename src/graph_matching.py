@@ -1,3 +1,4 @@
+from itertools import combinations
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -182,11 +183,15 @@ def estimate_weighted_rigid_transform_2d(
     if total_mass <= 1e-12:
         return np.eye(2), np.zeros(2), False
 
+    # transport_plan[i, j] は「source_i と target_j を対応させる重み」です。
+    # 行和・列和を各点の有効な重みとして使い、対応していない外れ値の影響を小さくします。
     row_mass = np.sum(transport_plan, axis=1)
     col_mass = np.sum(transport_plan, axis=0)
     source_centroid = (source_points.T @ row_mass) / total_mass
     target_centroid = (target_points.T @ col_mass) / total_mass
 
+    # 論文の Recovering transformation と同じく、重み付き中心を引いたあと、
+    # transport plan で重み付けした cross covariance を SVD にかけます。
     source_centered = source_points - source_centroid
     target_centered = target_points - target_centroid
     cross_cov = target_centered.T @ transport_plan.T @ source_centered
@@ -195,6 +200,8 @@ def estimate_weighted_rigid_transform_2d(
     correction = np.eye(2)
     correction[-1, -1] = np.linalg.det(vt_mat.T @ u_mat.T)
     rotation = vt_mat.T @ correction @ u_mat.T
+
+    # target を source 座標へ移す変換なので、t = source_center - R target_center です。
     translation = source_centroid - rotation @ target_centroid
     return rotation, translation, True
 
@@ -222,13 +229,23 @@ def partial_ot_transport_plan(
 
     beta2 = float(np.clip(beta2, 0.0, 1.0))
     epsilon = max(float(epsilon), 1e-12)
+
+    # 現在の剛体変換で target を source 側に写し、点間の二乗距離を cost にします。
+    # epsilon は entropy regularization の強さで、大きいほど遠い点にも質量が流れます。
     transformed_target = transform_points(target_points, rotation, translation)
     diff = source_points[:, None, :] - transformed_target[None, :, :]
     cost = np.sum(diff * diff, axis=2)
     kernel = np.exp(-cost / epsilon)
 
+    # 論文の実験設定と同じく、各点を一様な probability mass とみなします。
+    # source/target の marginal は [0, uniform mass] に制限するため、
+    # 対応先がない点は質量 0 まで落とせます。
     source_mass = np.full(num_source, 1.0 / num_source)
     target_mass = np.full(num_target, 1.0 / num_target)
+
+    # a, b は source/target marginal を調整する scaling 係数、
+    # g は transport plan 全体の mass を調整する係数です。
+    # 最終的な plan は pi = g * diag(a) * K * diag(b) になります。
     a = np.ones(num_source)
     b = np.ones(num_target)
     g = 1.0
@@ -239,17 +256,23 @@ def partial_ot_transport_plan(
         old_b = b.copy()
         old_g = g
 
+        # source 側の marginal が各点の持つ質量を超えないように a を更新します。
+        # RG[0, 1] 制約なので、上限だけ clip し、下限は 0 を許します。
         row_proposal = g * (kernel @ b)
         a = np.minimum(row_proposal, source_mass) / np.maximum(row_proposal, eps)
 
+        # target 側も同様に、各 target 点へ流れ込む質量を uniform mass 以下にします。
         col_proposal = g * (kernel.T @ a)
         b = np.minimum(col_proposal, target_mass) / np.maximum(col_proposal, eps)
 
+        # total transported mass を beta2 以下に制限します。
+        # beta2 を小さくすると、重なっている部分だけを選びやすくなります。
         unscaled_total = float(a @ kernel @ b)
         total_proposal = g * unscaled_total
         clipped_total = min(total_proposal, beta2)
         g = clipped_total / max(unscaled_total, eps)
 
+        # scaling 係数の変化が小さくなったら、transport plan の内側反復を止めます。
         delta = (
             np.linalg.norm(a - old_a)
             + np.linalg.norm(b - old_b)
@@ -258,6 +281,7 @@ def partial_ot_transport_plan(
         if delta < tol:
             break
 
+    # 連続値の soft correspondence。値が大きいほど、その点ペアに質量が流れています。
     return g * (a[:, None] * kernel * b[None, :])
 
 
@@ -274,6 +298,8 @@ def partial_ot_rigid_registration_2d(
 ) -> Tuple[Tuple[float, float, float], np.ndarray]:
     """partial OT と weighted Procrustes を交互に解く 2D rigid registration。"""
 
+    # initial_pose は target local 点群を source 座標に写す初期変換として使います。
+    # multi-agent pose adjustment では、target agent の現在 pose 推定が入ります。
     theta = initial_pose[2]
     rotation = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
     translation = np.array(initial_pose[:2], dtype=float)
@@ -284,6 +310,7 @@ def partial_ot_rigid_registration_2d(
         old_rotation = rotation.copy()
         old_translation = translation.copy()
 
+        # 1. 現在の pose で点間 cost を作り、partial OT により soft correspondence を更新します。
         transport_plan = partial_ot_transport_plan(
             source_points,
             target_points,
@@ -293,6 +320,8 @@ def partial_ot_rigid_registration_2d(
             beta2=beta2,
             inner_iter=inner_iter,
         )
+
+        # 2. 得られた soft correspondence を重みとして、target -> source の剛体変換を更新します。
         estimated_rotation, estimated_translation, did_update = estimate_weighted_rigid_transform_2d(
             source_points,
             target_points,
@@ -303,8 +332,11 @@ def partial_ot_rigid_registration_2d(
 
         rotation = estimated_rotation
         translation = estimated_translation
+
+        # epsilon を少しずつ小さくして、初期は大域的、後半は局所的な対応へ寄せます。
         current_epsilon *= float(epsilon_decay)
 
+        # pose 更新が十分小さくなったら外側反復を終了します。
         delta_translation = np.linalg.norm(translation - old_translation)
         delta_rotation = np.linalg.norm(rotation - old_rotation, ord="fro")
         if delta_translation + delta_rotation < tol:
@@ -718,6 +750,8 @@ def discretize_transport_plan(
     if transport_plan.size == 0 or np.all(transport_plan <= 0):
         return []
 
+    # transport plan は多対多の soft correspondence なので、可視化・評価用には
+    # Hungarian algorithm で1対1対応へ丸めます。
     row_ind, col_ind = linear_sum_assignment(-transport_plan)
     matches = []
     for r, c in zip(row_ind, col_ind):
@@ -740,6 +774,7 @@ def partial_ot_pairwise_matching(
 ) -> Tuple[List[Tuple[int, int, float]], Tuple[float, float, float], np.ndarray]:
     """global 推定点群同士を partial OT registration し、対応を返します。"""
 
+    # matching-only の比較では、既に noisy pose で global に投影された点同士を登録します。
     source_points = points_from_detections(dets_i, coordinate="global")
     target_points = points_from_detections(dets_j, coordinate="global")
     pose, transport_plan = partial_ot_rigid_registration_2d(
@@ -775,6 +810,8 @@ def partial_ot_anchor_pose_registration(
 ) -> Tuple[Tuple[float, float, float], List[Tuple[int, int, float]], np.ndarray]:
     """anchor global 点群へ target local 点群を partial OT で登録します。"""
 
+    # pose adjustment では、anchor は global 点、target は local 観測点として扱います。
+    # 登録で推定される target -> anchor の剛体変換が、そのまま target agent pose になります。
     source_points = points_from_detections(anchor_detections, coordinate="global")
     target_points = points_from_detections(target_detections, coordinate="local")
     estimated_pose, transport_plan = partial_ot_rigid_registration_2d(
@@ -1245,6 +1282,178 @@ def kwise_to_pairwise_matches(
         else:
             raise ValueError("pair must be (0, 1), (0, 2), or (1, 2)")
     return pairwise_matches
+
+
+def kwise_to_global_pairwise_matches(
+    kwise_matches: List[Tuple[int, int, int, float]],
+    triple: Tuple[int, int, int],
+    pair: Tuple[int, int],
+) -> List[Tuple[int, int, float]]:
+    """global agent id の pair を、triple 内の3-wise結果から取り出します。"""
+
+    if pair[0] not in triple or pair[1] not in triple:
+        raise ValueError("pair agents must be included in triple")
+
+    local_pair = (triple.index(pair[0]), triple.index(pair[1]))
+    return kwise_to_pairwise_matches(kwise_matches, pair=local_pair)
+
+
+def consistent_pairwise_matches_from_kwise_triples(
+    detections_by_agent: Dict[int, List[Detection]],
+    kwise_matches_by_triple: Dict[Tuple[int, int, int], List[Tuple[int, int, int, float]]],
+    agent_ids: Tuple[int, ...],
+    reference_agent_id: int = 0,
+    score_threshold: float = 1e-4,
+) -> Tuple[Dict[Tuple[int, int], List[Tuple[int, int, float]]], Dict[int, List[Tuple[int, int, float]]]]:
+    """3-wise 結果群を reference agent 経由の cycle-consistent pairwise 対応に統合します。
+
+    Zhu et al. の k-wise MGM は、各 k-wise indicator tensor を reference graph r
+    への pairwise indicator matrix X[ir] に分解し、最後に W = U^T U で全体の
+    pairwise 対応を構成します。この関数はその考え方を、既存の3-wise RRWM結果に
+    対する one-shot な投票集約として実装します。
+    """
+
+    if reference_agent_id not in agent_ids:
+        raise ValueError("reference_agent_id must be included in agent_ids")
+
+    ref_detections = detections_by_agent[reference_agent_id]
+    ref_id_to_index = {det.det_id: idx for idx, det in enumerate(ref_detections)}
+    votes = {
+        agent_id: np.zeros((len(ref_detections), len(detections_by_agent[agent_id])))
+        for agent_id in agent_ids
+        if agent_id != reference_agent_id
+    }
+
+    for triple, kwise_matches in kwise_matches_by_triple.items():
+        if reference_agent_id not in triple:
+            continue
+
+        for match in kwise_matches:
+            det_ids_by_agent = {
+                triple[0]: match[0],
+                triple[1]: match[1],
+                triple[2]: match[2],
+            }
+            score = float(match[3])
+            ref_det_id = det_ids_by_agent[reference_agent_id]
+            if ref_det_id not in ref_id_to_index:
+                continue
+
+            ref_idx = ref_id_to_index[ref_det_id]
+            for agent_id in triple:
+                if agent_id == reference_agent_id:
+                    continue
+
+                target_det_id = det_ids_by_agent[agent_id]
+                target_id_to_index = {
+                    det.det_id: idx for idx, det in enumerate(detections_by_agent[agent_id])
+                }
+                target_idx = target_id_to_index.get(target_det_id)
+                if target_idx is not None:
+                    votes[agent_id][ref_idx, target_idx] += score
+
+    reference_matches = {}
+    for agent_id, score_matrix in votes.items():
+        if score_matrix.size == 0 or np.all(score_matrix <= 0):
+            reference_matches[agent_id] = []
+            continue
+
+        row_ind, col_ind = linear_sum_assignment(-score_matrix)
+        matches = []
+        for ref_idx, target_idx in zip(row_ind, col_ind):
+            score = score_matrix[ref_idx, target_idx]
+            if score <= score_threshold:
+                continue
+
+            matches.append(
+                (
+                    ref_detections[ref_idx].det_id,
+                    detections_by_agent[agent_id][target_idx].det_id,
+                    float(score),
+                )
+            )
+        reference_matches[agent_id] = matches
+
+    pairwise_matches = {}
+    for i, j in combinations(agent_ids, 2):
+        if i == reference_agent_id:
+            pairwise_matches[(i, j)] = list(reference_matches.get(j, []))
+            continue
+        if j == reference_agent_id:
+            pairwise_matches[(i, j)] = [
+                (target_id, ref_id, score)
+                for ref_id, target_id, score in reference_matches.get(i, [])
+            ]
+            continue
+
+        i_by_ref = {
+            ref_id: (target_id, score)
+            for ref_id, target_id, score in reference_matches.get(i, [])
+        }
+        j_by_ref = {
+            ref_id: (target_id, score)
+            for ref_id, target_id, score in reference_matches.get(j, [])
+        }
+        composed = []
+        for ref_id in sorted(set(i_by_ref) & set(j_by_ref)):
+            i_det_id, i_score = i_by_ref[ref_id]
+            j_det_id, j_score = j_by_ref[ref_id]
+            composed.append((i_det_id, j_det_id, float(min(i_score, j_score))))
+        pairwise_matches[(i, j)] = composed
+
+    return pairwise_matches, reference_matches
+
+
+def run_consistent_kwise_rrwm_matching(
+    detections_by_agent: Dict[int, List[Detection]],
+    agent_ids: Tuple[int, ...],
+    kwise_params: Dict[str, float] = None,
+    reference_agent_id: int = 0,
+    score_threshold: float = 1e-4,
+) -> Tuple[Dict[Tuple[int, int], List[Tuple[int, int, float]]], Dict[str, object]]:
+    """全3-agent triple の3-wise RRWM結果を reference 経由で一貫化します。"""
+
+    if kwise_params is None:
+        kwise_params = KWISE_PARAMS
+
+    triples = list(combinations(agent_ids, 3))
+    kwise_results_by_triple = {}
+    kwise_matches_by_triple = {}
+
+    for triple in triples:
+        matches, soft_score, affinity_matrix, candidates = kwise_rrwm_matching_3agents(
+            detections_by_agent[triple[0]],
+            detections_by_agent[triple[1]],
+            detections_by_agent[triple[2]],
+            **kwise_params,
+        )
+        kwise_results_by_triple[triple] = {
+            "matches": matches,
+            "evaluation": evaluate_kwise_matching_3agents(
+                detections_by_agent[triple[0]],
+                detections_by_agent[triple[1]],
+                detections_by_agent[triple[2]],
+                matches,
+            ),
+            "soft_score": soft_score,
+            "affinity_matrix": affinity_matrix,
+            "candidates": candidates,
+        }
+        kwise_matches_by_triple[triple] = matches
+
+    pairwise_matches, reference_matches = consistent_pairwise_matches_from_kwise_triples(
+        detections_by_agent,
+        kwise_matches_by_triple,
+        agent_ids=agent_ids,
+        reference_agent_id=reference_agent_id,
+        score_threshold=score_threshold,
+    )
+
+    return pairwise_matches, {
+        "kwise_results_by_triple": kwise_results_by_triple,
+        "reference_matches": reference_matches,
+        "reference_agent_id": reference_agent_id,
+    }
 
 
 def evaluate_kwise_as_pairwise(

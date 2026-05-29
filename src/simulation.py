@@ -103,12 +103,13 @@ def generate_true_scene(
     if rng is None:
         rng = np.random.default_rng(seed)
 
-    # 3エージェントは手動配置します。
+    # エージェントは手動配置します。
     # theta はエージェントの向きです。
     agents = [
         AgentGT(0, -18.0, -8.0, np.deg2rad(15)),
         AgentGT(1, 18.0, -6.0, np.deg2rad(165)),
         AgentGT(2, 0.0, 16.0, np.deg2rad(-90)),
+        AgentGT(3, 0.0, -18.0, np.deg2rad(90)),
     ]
 
     if num_agents > len(agents):
